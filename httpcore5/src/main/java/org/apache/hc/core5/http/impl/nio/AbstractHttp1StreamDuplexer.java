@@ -95,6 +95,8 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
     private final NHttpMessageWriter<OutgoingMessage> outgoingMessageWriter;
     private final ContentLengthStrategy incomingContentStrategy;
     private final ContentLengthStrategy outgoingContentStrategy;
+    private final AtomicInteger inputWindow;
+    private final int lowMark;
     private final ByteBuffer contentBuffer;
     private final Lock outputLock;
     private final AtomicInteger outputRequests;
@@ -131,6 +133,8 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
                 DefaultContentLengthStrategy.INSTANCE;
         this.outgoingContentStrategy = outgoingContentStrategy != null ? outgoingContentStrategy :
                 DefaultContentLengthStrategy.INSTANCE;
+        this.inputWindow = new AtomicInteger(0);
+        this.lowMark = this.inbuf.capacity() / 2;
         this.contentBuffer = ByteBuffer.allocate(this.h1Config.getBufferSize());
         this.outputLock = new ReentrantLock();
         this.outputRequests = new AtomicInteger(0);
@@ -187,7 +191,7 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
             SessionOutputBuffer buffer,
             BasicHttpTransportMetrics metrics) throws HttpException;
 
-    abstract int consumeData(ByteBuffer src) throws HttpException, IOException;
+    abstract void consumeData(ByteBuffer src) throws HttpException, IOException;
 
     abstract void updateCapacity(CapacityChannel capacityChannel) throws HttpException, IOException;
 
@@ -239,6 +243,19 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
         processCommands();
     }
 
+    private int updateWindow(final AtomicInteger window, final int delta) throws ArithmeticException {
+        for (;;) {
+            final int current = window.get();
+            final long newValue = (long) current + delta;
+            if (Math.abs(newValue) > 0x7fffffffL) {
+                throw new ArithmeticException("Update causes flow control window to exceed " + Integer.MAX_VALUE);
+            }
+            if (window.compareAndSet(current, (int) newValue)) {
+                return (int) newValue;
+            }
+        }
+    }
+
     public final void onInput() throws HttpException, IOException {
         while (connState.compareTo(ConnectionState.SHUTDOWN) < 0) {
             int totalBytesRead = 0;
@@ -274,6 +291,7 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
                             consumeHeader(messageHead, null);
                             contentDecoder = null;
                         }
+                        inputWindow.set(h1Config.getInitialWindowSize());
                         if (contentDecoder != null) {
                             incomingMessage = new Message<>(messageHead, contentDecoder);
                             break;
@@ -304,8 +322,9 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
                 while ((bytesRead = contentDecoder.read(contentBuffer)) > 0) {
                     totalBytesRead += bytesRead;
                     contentBuffer.flip();
-                    final int capacity = consumeData(contentBuffer);
+                    consumeData(contentBuffer);
                     contentBuffer.clear();
+                    final int capacity = updateWindow(inputWindow, -bytesRead);
                     if (capacity <= 0) {
                         if (!contentDecoder.isCompleted()) {
                             ioSession.clearEvent(SelectionKey.OP_READ);
@@ -314,6 +333,10 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
                                 @Override
                                 public void update(final int increment) throws IOException {
                                     if (increment > 0) {
+                                        final int capacity = inputWindow.get();
+                                        final int remaining = capacity > 0 ? Integer.MAX_VALUE - capacity : Integer.MAX_VALUE;
+                                        final int chunk = Math.min(increment, remaining);
+                                        updateWindow(inputWindow, chunk);
                                         requestSessionInput();
                                     }
                                 }
@@ -476,10 +499,6 @@ abstract class AbstractHttp1StreamDuplexer<IncomingMessage extends HttpMessage, 
 
     void requestSessionInput() {
         ioSession.setEvent(SelectionKey.OP_READ);
-    }
-
-    void suspendSessionInput() {
-        ioSession.clearEvent(SelectionKey.OP_READ);
     }
 
     void requestSessionOutput() {
